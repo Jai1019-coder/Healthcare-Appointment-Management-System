@@ -1,0 +1,334 @@
+// Healthcare Appointment & Follow-up Manager
+// Prisma schema - PostgreSQL
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------------
+// ENUMS
+// ---------------------------------------------------------------------------
+
+enum Role {
+  ADMIN
+  DOCTOR
+  PATIENT
+}
+
+enum AppointmentStatus {
+  PENDING // slot held, awaiting confirmation (used during booking transaction)
+  CONFIRMED
+  CANCELLED
+  COMPLETED
+  RESCHEDULED // superseded by a new appointment
+}
+
+enum SummaryType {
+  PRE_VISIT
+  POST_VISIT
+}
+
+enum Urgency {
+  LOW
+  MEDIUM
+  HIGH
+}
+
+enum EmailType {
+  BOOKING_CONFIRMATION
+  REMINDER
+  CANCELLATION
+  RESCHEDULE
+  DOCTOR_LEAVE_NOTICE
+  MEDICATION_REMINDER
+  DOCTOR_NEW_BOOKING
+}
+
+enum EmailStatus {
+  PENDING
+  SENT
+  FAILED
+}
+
+// ---------------------------------------------------------------------------
+// CORE USER MODELS
+// ---------------------------------------------------------------------------
+
+model User {
+  id           String   @id @default(uuid())
+  email        String   @unique
+  passwordHash String
+  role         Role
+  fullName     String
+  phone        String?
+  isActive     Boolean  @default(true)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  doctorProfile  Doctor?
+  patientProfile Patient?
+  auditLogs      AuditLog[]
+
+  // OAuth tokens for this user's own Google Calendar (patient or doctor)
+  googleAuth GoogleAuthToken?
+
+  @@index([role])
+}
+
+model Patient {
+  id        String   @id @default(uuid())
+  userId    String   @unique
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  dateOfBirth DateTime?
+  createdAt DateTime @default(now())
+
+  appointments Appointment[]
+}
+
+model Doctor {
+  id                  String   @id @default(uuid())
+  userId              String   @unique
+  user                User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  specialization      String
+  slotDurationMinutes Int      @default(30)
+  bio                 String?
+  createdAt           DateTime @default(now())
+  updatedAt           DateTime @updatedAt
+
+  workingHours  DoctorWorkingHour[]
+  leaves        DoctorLeave[]
+  appointments  Appointment[]
+
+  @@index([specialization])
+}
+
+// Recurring weekly availability, e.g. Monday 09:00-17:00
+model DoctorWorkingHour {
+  id        String @id @default(uuid())
+  doctorId  String
+  doctor    Doctor @relation(fields: [doctorId], references: [id], onDelete: Cascade)
+  dayOfWeek Int // 0 = Sunday .. 6 = Saturday
+  startTime String // "09:00" (24h, doctor's local clinic time)
+  endTime   String // "17:00"
+
+  @@index([doctorId, dayOfWeek])
+}
+
+// A doctor blocking out a specific date (or date range) as leave
+model DoctorLeave {
+  id        String   @id @default(uuid())
+  doctorId  String
+  doctor    Doctor   @relation(fields: [doctorId], references: [id], onDelete: Cascade)
+  startDate DateTime
+  endDate   DateTime
+  reason    String?
+  createdAt DateTime @default(now())
+
+  @@index([doctorId, startDate, endDate])
+}
+
+// Stores a user's Google OAuth2 refresh token so we can create/update/delete
+// calendar events on their behalf.
+model GoogleAuthToken {
+  id           String   @id @default(uuid())
+  userId       String   @unique
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  refreshToken String
+  accessToken  String?
+  expiryDate   DateTime?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+}
+
+// ---------------------------------------------------------------------------
+// APPOINTMENTS
+// ---------------------------------------------------------------------------
+
+model Appointment {
+  id        String            @id @default(uuid())
+  patientId String
+  patient   Patient           @relation(fields: [patientId], references: [id], onDelete: Cascade)
+  doctorId  String
+  doctor    Doctor            @relation(fields: [doctorId], references: [id], onDelete: Cascade)
+
+  slotStart DateTime
+  slotEnd   DateTime
+  status    AppointmentStatus @default(PENDING)
+
+  // If this appointment replaced an earlier one via reschedule
+  rescheduledFromId String?      @unique
+  rescheduledFrom   Appointment? @relation("RescheduleChain", fields: [rescheduledFromId], references: [id])
+  rescheduledTo     Appointment? @relation("RescheduleChain")
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  symptomReport   SymptomReport?
+  aiSummaries     AISummary[]
+  postVisitNote   PostVisitNote?
+  prescriptions   Prescription[]
+  calendarEvent   CalendarEvent?
+  emailLogs       EmailLog[]
+
+  @@index([patientId])
+  @@index([doctorId, slotStart])
+  @@index([status])
+}
+
+// A row exists here for the duration an appointment actively holds a slot
+// (PENDING or CONFIRMED). The unique constraint below is what actually
+// prevents double-booking at the database level: two concurrent booking
+// transactions racing for the same doctor+slotStart will have one succeed
+// and one fail with a unique-constraint violation, which the service layer
+// converts into a 409 Conflict. Deleting the lock (on cancel/reschedule)
+// immediately frees the slot for re-booking - a plain unique index directly
+// on Appointment can't do this cleanly because cancelled rows would
+// permanently occupy the slot.
+model SlotLock {
+  id            String   @id @default(uuid())
+  doctorId      String
+  slotStart     DateTime
+  appointmentId String   @unique
+  createdAt     DateTime @default(now())
+
+  @@unique([doctorId, slotStart], name: "doctor_slot_lock_unique")
+}
+
+model SymptomReport {
+  id            String      @id @default(uuid())
+  appointmentId String      @unique
+  appointment   Appointment @relation(fields: [appointmentId], references: [id], onDelete: Cascade)
+  description   String
+  durationDays  Int?
+  severity      String?
+  createdAt     DateTime    @default(now())
+}
+
+// ---------------------------------------------------------------------------
+// AI SUMMARIES
+// ---------------------------------------------------------------------------
+
+model AISummary {
+  id                String      @id @default(uuid())
+  appointmentId     String
+  appointment       Appointment @relation(fields: [appointmentId], references: [id], onDelete: Cascade)
+  type              SummaryType
+
+  // PRE_VISIT fields
+  urgency           Urgency?
+  chiefComplaint    String?
+  suggestedQuestions String[]  @default([])
+
+  // POST_VISIT fields
+  patientSummary     String?
+  medicationSchedule  Json?
+  followUpInstructions String?
+
+  rawResponse String? // full raw LLM text, for audit/debug
+  model       String  // which LLM model produced this
+  failed      Boolean @default(false)
+  errorMessage String?
+
+  createdAt DateTime @default(now())
+
+  @@index([appointmentId, type])
+}
+
+// ---------------------------------------------------------------------------
+// POST-VISIT / PRESCRIPTIONS
+// ---------------------------------------------------------------------------
+
+model PostVisitNote {
+  id            String      @id @default(uuid())
+  appointmentId String      @unique
+  appointment   Appointment @relation(fields: [appointmentId], references: [id], onDelete: Cascade)
+  clinicalNotes String
+  createdAt     DateTime    @default(now())
+}
+
+model Prescription {
+  id             String      @id @default(uuid())
+  appointmentId  String
+  appointment    Appointment @relation(fields: [appointmentId], references: [id], onDelete: Cascade)
+  medicationName String
+  dosage         String
+  frequencyPerDay Int
+  durationDays   Int
+  instructions   String?
+  createdAt      DateTime    @default(now())
+
+  reminders MedicationReminder[]
+
+  @@index([appointmentId])
+}
+
+model MedicationReminder {
+  id             String       @id @default(uuid())
+  prescriptionId String
+  prescription   Prescription @relation(fields: [prescriptionId], references: [id], onDelete: Cascade)
+  scheduledAt    DateTime
+  sent           Boolean      @default(false)
+  sentAt         DateTime?
+  createdAt      DateTime     @default(now())
+
+  @@index([scheduledAt, sent])
+}
+
+// ---------------------------------------------------------------------------
+// CALENDAR
+// ---------------------------------------------------------------------------
+
+model CalendarEvent {
+  id                String      @id @default(uuid())
+  appointmentId     String      @unique
+  appointment       Appointment @relation(fields: [appointmentId], references: [id], onDelete: Cascade)
+  googleEventId     String?
+  organizerCalendarId String?
+  syncStatus        String      @default("PENDING") // PENDING | SYNCED | FAILED
+  lastError         String?
+  createdAt         DateTime    @default(now())
+  updatedAt         DateTime    @updatedAt
+}
+
+// ---------------------------------------------------------------------------
+// EMAIL LOGS (for retry + audit)
+// ---------------------------------------------------------------------------
+
+model EmailLog {
+  id            String       @id @default(uuid())
+  appointmentId String?
+  appointment   Appointment? @relation(fields: [appointmentId], references: [id], onDelete: SetNull)
+  toEmail       String
+  type          EmailType
+  status        EmailStatus  @default(PENDING)
+  attempts      Int          @default(0)
+  lastError     String?
+  createdAt     DateTime     @default(now())
+  updatedAt     DateTime     @updatedAt
+
+  @@index([status])
+  @@index([appointmentId])
+}
+
+// ---------------------------------------------------------------------------
+// AUDIT LOG
+// ---------------------------------------------------------------------------
+
+model AuditLog {
+  id        String   @id @default(uuid())
+  userId    String?
+  user      User?    @relation(fields: [userId], references: [id], onDelete: SetNull)
+  action    String
+  entity    String
+  entityId  String?
+  metadata  Json?
+  createdAt DateTime @default(now())
+
+  @@index([entity, entityId])
+  @@index([userId])
+}
